@@ -113,12 +113,13 @@ class Tool:
             os.makedirs(output_folder, exist_ok=True)
 
         for page_num in range(start_page, end_page + 1):
-            pagestring = str(page_num + 1).zfill(2)  # 01, 02, 10, ...
-            output_filename = f"{project_id}_p{pagestring}_{county}.tif"
+            pagestring = str(page_num + 1).zfill(2)  # 01, 02, ...
+            # Append "_County_Project" to county name
+            county_suffix = f"{county}_County_Project"
+            output_filename = f"{project_id}_p{pagestring}_{county_suffix}.tif"
             output_path = os.path.join(output_folder, output_filename)
 
-            # IMPORTANT: specify the page number (1-based) so each loop exports the correct page
-            # PDFToTIFF(in_pdf_file, out_tiff_file, {pdf_password}, {pdf_page_number})
+            # Specify the page number (1-based) so each loop exports the correct page
             arcpy.conversion.PDFToTIFF(
                 input_pdf_path,
                 output_path,
@@ -134,3 +135,4 @@ class Tool:
     def postExecute(self, parameters):
         """Runs after outputs are processed and added to the display."""
         return
+
