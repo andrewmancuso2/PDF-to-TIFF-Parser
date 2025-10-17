@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 import os
-import arcpy
+import re
 import uuid
+import arcpy
 
 class Toolbox:
     def __init__(self):
@@ -12,12 +13,12 @@ class Toolbox:
 class Tool:
     def __init__(self):
         self.label = "PDF2TIFF"
-        self.description = "PDF to TIFF conversion tool (old-behavior export + QoL UI)"
+        self.description = "PDF to TIFF (base behavior) + skip failures + failures table named by Project ID in project GDB"
 
     def getParameterInfo(self):
         params = []
 
-        # 1) Input PDF at top
+        # 1) Input PDF
         input_file = arcpy.Parameter(
             displayName="Input PDF File",
             name="input_pdf",
@@ -27,7 +28,7 @@ class Tool:
         )
         input_file.filter.list = ["pdf"]
 
-        # 2) Output folder (left blank; no autofill)
+        # 2) Output folder (no autofill)
         output_folder = arcpy.Parameter(
             displayName="Output Folder Path",
             name="output_folder",
@@ -36,7 +37,7 @@ class Tool:
             direction="Input",
         )
 
-        # 3) Page Start dropdown (GPString for reliable ValueList UI)
+        # 3/4) Page range dropdowns
         page_start = arcpy.Parameter(
             displayName="Page Start",
             name="page_start",
@@ -45,9 +46,8 @@ class Tool:
             direction="Input",
         )
         page_start.filter.type = "ValueList"
-        page_start.filter.list = []  # populated after PDF is chosen
+        page_start.filter.list = []
 
-        # 4) Page End dropdown
         page_end = arcpy.Parameter(
             displayName="Page End",
             name="page_end",
@@ -56,7 +56,7 @@ class Tool:
             direction="Input",
         )
         page_end.filter.type = "ValueList"
-        page_end.filter.list = []  # populated after PDF is chosen
+        page_end.filter.list = []
 
         # 5) Project ID
         project_id = arcpy.Parameter(
@@ -76,28 +76,20 @@ class Tool:
             direction="Input",
         )
 
-        # UI order
-        params.append(input_file)
-        params.append(output_folder)
-        params.append(page_start)
-        params.append(page_end)
-        params.append(project_id)
-        params.append(county)
+        params.extend([input_file, output_folder, page_start, page_end, project_id, county])
 
-        # Refresh page lists when PDF changes
+        # Populate page lists when PDF changes
         page_start.parameterDependencies = [input_file.name]
         page_end.parameterDependencies   = [input_file.name]
-
         return params
 
     def isLicensed(self):
         return True
 
     def updateParameters(self, parameters):
-        """Populate page dropdowns from selected PDF; keep End >= Start; do not autofill output folder."""
         input_pdf, output_folder, page_start, page_end, project_id, county = parameters
 
-        # Populate dropdowns from the chosen PDF
+        # Populate page dropdowns from the chosen PDF
         if input_pdf.altered and input_pdf.valueAsText and os.path.isfile(input_pdf.valueAsText):
             try:
                 pdf_doc = arcpy.mp.PDFDocumentOpen(input_pdf.valueAsText)
@@ -108,18 +100,27 @@ class Tool:
                 page_start.filter.list = pages
                 page_end.filter.list   = pages
 
-                # Set defaults only if user hasn't set them yet
+                # Defaults (only if user hasn't set them yet)
                 if not page_start.altered:
                     page_start.value = "1"
                 if not page_end.altered:
                     page_end.value = str(page_count)
+
+                # Clamp stale selections if user changed PDFs
+                try:
+                    if page_start.value and int(page_start.value) > page_count:
+                        page_start.value = str(page_count)
+                    if page_end.value and int(page_end.value) > page_count:
+                        page_end.value = str(page_count)
+                except Exception:
+                    pass
 
             except Exception as ex:
                 arcpy.AddWarning(f"Could not read PDF page count: {ex}")
                 page_start.filter.list = []
                 page_end.filter.list   = []
 
-        # If user pasted a file path into the folder field, coerce to its directory (no autofill otherwise)
+        # If a file path was pasted into folder field, coerce to its directory
         if output_folder.valueAsText:
             path = output_folder.valueAsText
             root, ext = os.path.splitext(path)
@@ -128,7 +129,7 @@ class Tool:
                 if dir_only and os.path.isdir(dir_only):
                     output_folder.value = dir_only
 
-        # Ensure End >= Start if both are set
+        # Keep End >= Start
         try:
             if page_start.value and page_end.value:
                 if int(page_end.value) < int(page_start.value):
@@ -141,48 +142,90 @@ class Tool:
     def updateMessages(self, parameters):
         return
 
+    # ---------- helpers ----------
+    @staticmethod
+    def _sanitize_for_fs(s, maxlen=120):
+        return re.sub(r'[<>:"/\\|?*\s]+', '_', s.strip())[:maxlen]
+
+    @staticmethod
+    def _sr_equal(a, b):
+        try:
+            if a.factoryCode and b.factoryCode:
+                return a.factoryCode == b.factoryCode
+            return a.name == b.name
+        except Exception:
+            return False
+
+    @staticmethod
+    def _pick_transform(in_sr, out_sr):
+        try:
+            cands = arcpy.ListTransformations(in_sr, out_sr)
+            if not cands:
+                return ""
+            for key in ("NAD_1983", "HARN", "NSRS2007", "2011", "ETRS", "NAVD"):
+                for c in cands:
+                    if key in c:
+                        return c
+            return cands[0]
+        except Exception:
+            return ""
+    # -----------------------------
+
     def execute(self, parameters, messages):
         arcpy.env.overwriteOutput = True
 
         input_pdf_path = parameters[0].valueAsText
         output_folder  = parameters[1].valueAsText
-        start_page = int(parameters[2].value) - 1   # 0-based internal
-        end_page   = int(parameters[3].value) - 1
-        project_id = parameters[4].valueAsText
-        county     = parameters[5].valueAsText
+        start_page     = int(parameters[2].value) - 1   # 0-based internal
+        end_page       = int(parameters[3].value) - 1
+        project_id     = parameters[4].valueAsText
+        county         = parameters[5].valueAsText
 
-        # Final safety: if output_folder points to a file, use its directory
+        # Ensure output folder exists (user chooses it; we don't autofill)
         if output_folder:
             root, ext = os.path.splitext(output_folder)
             if ext and not os.path.isdir(output_folder):
                 maybe_dir = os.path.dirname(output_folder)
                 if maybe_dir and os.path.isdir(maybe_dir):
                     output_folder = maybe_dir
-
-        aprx = arcpy.mp.ArcGISProject("CURRENT")
-        map_obj = aprx.activeMap or aprx.listMaps()[0]
-        target_sr = map_obj.spatialReference
-
-        # Ensure output folder exists (user chose it; we don't autofill)
         if not os.path.isdir(output_folder):
             os.makedirs(output_folder, exist_ok=True)
 
+        # Get map + target SR
+        aprx = arcpy.mp.ArcGISProject("CURRENT")
+        map_obj = aprx.activeMap or (aprx.listMaps()[0] if aprx.listMaps() else None)
+        target_sr = map_obj.spatialReference if map_obj else arcpy.SpatialReference(4326)
+
+        # Preflight: page count & requested range
+        try:
+            pdf_doc = arcpy.mp.PDFDocumentOpen(input_pdf_path)
+            page_count = pdf_doc.pageCount
+            del pdf_doc
+        except Exception as ex:
+            arcpy.AddError(f"Could not read page count: {ex}")
+            raise arcpy.ExecuteError
+
+        req_start_1b = start_page + 1
+        req_end_1b   = end_page + 1
+        if req_start_1b < 1 or req_end_1b > page_count:
+            arcpy.AddError(
+                f"Requested page range {req_start_1b}-{req_end_1b} exceeds this PDF's pageCount={page_count}."
+            )
+            raise arcpy.ExecuteError
+
+        # Failure collector — recorded only when an export fails
+        failures = []
+
         # --- helpers (scoped to execute) ---
         def pick_transform(in_sr, out_sr):
-            try:
-                cands = arcpy.ListTransformations(in_sr, out_sr)
-                return cands[0] if cands else ""
-            except Exception:
-                return ""
+            return self._pick_transform(in_sr, out_sr)
 
         def project_raster_in_place(in_path, out_sr):
             """
-            Reproject 'in_path' to 'out_sr' IN PLACE:
+            Reproject 'in_path' to 'out_sr' IN PLACE (base behavior):
             - If input has Unknown CRS -> no-op.
             - If CRS matches out_sr -> no-op.
-            - Else ProjectRaster to a temporary path in same folder,
-              then atomically replace original file with projected version.
-            Returns the final path (same as input).
+            - Else ProjectRaster to a temporary path in same folder, then replace original.
             """
             try:
                 desc = arcpy.Describe(in_path)
@@ -192,11 +235,10 @@ class Tool:
                 return in_path
 
             if (in_sr is None) or (in_sr.name == "Unknown"):
-                arcpy.AddMessage(f"[INFO] {os.path.basename(in_path)}: no defined CRS. Leaving as-is.")
+                # Export succeeded; just no defined CRS — treat as success
                 return in_path
 
-            if (in_sr.factoryCode == out_sr.factoryCode) and (in_sr.name == out_sr.name):
-                arcpy.AddMessage(f"[INFO] {os.path.basename(in_path)}: already in target CRS.")
+            if self._sr_equal(in_sr, out_sr):
                 return in_path
 
             folder = os.path.dirname(in_path)
@@ -204,57 +246,27 @@ class Tool:
             tmp_path = os.path.join(folder, f"{base}.__tmp_{uuid.uuid4().hex}.tif")
 
             gtrans = pick_transform(in_sr, out_sr)
-            arcpy.AddMessage(
-                f"[INFO] Reprojecting {os.path.basename(in_path)} "
-                f"from '{in_sr.name}' ({in_sr.factoryCode}) to '{out_sr.name}' ({out_sr.factoryCode}) "
-                f"{'(transformation: ' + gtrans + ')' if gtrans else '(no transformation)'}"
-            )
-
-            arcpy.management.ProjectRaster(
-                in_raster=in_path,
-                out_raster=tmp_path,
-                out_coor_system=out_sr,
-                resampling_type="NEAREST",
-                cell_size=None,
-                geographic_transform=gtrans if gtrans else ""
-            )
-
-            # Replace original safely
             try:
-                arcpy.management.Delete(in_path)
-            except Exception:
+                arcpy.management.ProjectRaster(
+                    in_raster=in_path,
+                    out_raster=tmp_path,
+                    out_coor_system=out_sr,
+                    resampling_type="NEAREST",
+                    cell_size=None,
+                    geographic_transform=gtrans if gtrans else ""
+                )
                 try:
-                    aside = os.path.join(folder, f"{base}.__old_{uuid.uuid4().hex}.tif")
-                    os.replace(in_path, aside)
-                    arcpy.management.Delete(aside)
-                except Exception as ex:
-                    arcpy.AddWarning(f"[WARN] Could not remove original before replace: {ex}")
-
-            os.replace(tmp_path, in_path)
-            arcpy.AddMessage(f"[INFO] Updated in place: {os.path.basename(in_path)}")
+                    arcpy.management.Delete(in_path)
+                except Exception:
+                    pass
+                os.replace(tmp_path, in_path)
+            except Exception as ex_proj:
+                # Reprojection failed — keep original (don’t record as a page failure)
+                arcpy.AddWarning(f"[WARN] Reprojection failed for {os.path.basename(in_path)}: {ex_proj}")
             return in_path
         # --- end helpers ---
 
-        # Preflight: page count check (avoid 003464 on out-of-range)
-        try:
-            pdf_doc = arcpy.mp.PDFDocumentOpen(input_pdf_path)
-            page_count = pdf_doc.pageCount
-            del pdf_doc
-        except Exception as ex:
-            arcpy.AddWarning(f"[WARN] Could not read page count: {ex}")
-            page_count = None
-
-        if page_count is not None:
-            req_start_1b = start_page + 1
-            req_end_1b   = end_page + 1
-            if req_start_1b < 1 or req_end_1b > page_count:
-                arcpy.AddError(
-                    f"Requested page range {req_start_1b}-{req_end_1b} exceeds this PDF's pageCount={page_count}."
-                )
-                raise arcpy.ExecuteError
-
-        # Export loop — EXACTLY the old working behavior:
-        # arcpy.conversion.PDFToTIFF(input_pdf, output_tif, None, page_num+1)
+        # Export loop — EXACT base working call, but skip pages on failure
         for page_num in range(start_page, end_page + 1):
             page_1b = page_num + 1
             pagestring = str(page_1b).zfill(2)  # 01, 02, ...
@@ -269,28 +281,90 @@ class Tool:
                 except Exception:
                     pass
 
-            # --- The core export call (same as your old code) ---
+            # --- Core export (legacy 4-arg) ---
             try:
+                # Base behavior that worked for you: (in_pdf, out_tif, pdf_password, pdf_page_number)
                 arcpy.conversion.PDFToTIFF(
                     input_pdf_path,
                     output_path,
-                    None,            # pdf_password (not used)
-                    page_1b          # pdf_page_number (1-based)
+                    None,
+                    page_1b
                 )
-                arcpy.AddMessage(f"[INFO] Exported page {page_1b} via 4-arg PDFToTIFF.")
-            except Exception as ex:
-                arcpy.AddError(f"Failed exporting page {page_1b}: {ex}")
-                raise
+                arcpy.AddMessage(f"[OK] Exported page {page_1b} → {output_filename}")
 
-            # Reproject IN PLACE if/when needed
-            final_path = project_raster_in_place(output_path, target_sr)
+            except Exception as ex_export:
+                # SKIP this page and record failure (do not raise)
+                failures.append({
+                    "pdf_path": input_pdf_path,
+                    "page": page_1b,
+                    "output": output_path,
+                    "error": str(ex_export)
+                })
+                arcpy.AddWarning(f"[SKIP] Page {page_1b} failed: {ex_export}")
+                continue
 
-            # Add the one-and-only file to the map
-            map_obj.addDataFromPath(final_path)
+            # Reproject IN PLACE if/when needed (doesn't affect failure list)
+            try:
+                final_path = project_raster_in_place(output_path, target_sr)
+            except Exception as ex_post:
+                arcpy.AddWarning(f"[WARN] Post-process issue on page {page_1b}: {ex_post}")
+                final_path = output_path
+
+            # Add the one-and-only file to the map (same as base)
+            try:
+                if map_obj:
+                    map_obj.addDataFromPath(final_path)
+            except Exception as ex_add:
+                arcpy.AddWarning(f"[WARN] Added TIFF but couldn't add to map (page {page_1b}): {ex_add}")
+
+        # ---------- Write failures (if any) into the Project's Default GDB and add table to map ----------
+        if failures:
+            try:
+                gdb = aprx.defaultGeodatabase
+                if not gdb or not os.path.isdir(gdb):
+                    # Fallback to project home if default GDB missing (rare)
+                    gdb = aprx.homeFolder
+
+                # Table name includes Project ID; overwrite if already exists
+                safe_pid = self._sanitize_for_fs(project_id)
+                tbl_name = f"PDF2TIFF_Failures_{safe_pid}"
+                tbl_path = os.path.join(gdb, tbl_name)
+                if arcpy.Exists(tbl_path):
+                    arcpy.management.Delete(tbl_path)
+
+                # Create table & fields
+                arcpy.management.CreateTable(os.path.dirname(tbl_path), os.path.basename(tbl_path))
+                arcpy.management.AddField(tbl_path, "Page", "LONG")
+                arcpy.management.AddField(tbl_path, "PDF_Path", "TEXT", field_length=512)
+                arcpy.management.AddField(tbl_path, "Output_Path", "TEXT", field_length=512)
+                arcpy.management.AddField(tbl_path, "Error", "TEXT", field_length=1024)
+
+                # Insert rows
+                with arcpy.da.InsertCursor(tbl_path, ["Page", "PDF_Path", "Output_Path", "Error"]) as cur:
+                    for f in failures:
+                        cur.insertRow([f["page"], f["pdf_path"], f["output"], f["error"]])
+
+                # Add the table to the current map so it's visible in Contents
+                if map_obj:
+                    try:
+                        map_obj.addDataFromPath(tbl_path)
+                    except Exception:
+                        pass
+
+                # Print a compact summary in the GP Messages pane
+                pages_str = ", ".join(str(f["page"]) for f in failures)
+                arcpy.AddWarning(f"[SUMMARY] Skipped pages ({len(failures)}): {pages_str}")
+                arcpy.AddMessage(f"[INFO] Failure details table added to project GDB: {tbl_name}")
+
+            except Exception as ex_tbl:
+                arcpy.AddWarning(f"[WARN] Could not write failures table to project GDB: {ex_tbl}")
+                pages_str = ", ".join(str(f["page"]) for f in failures)
+                arcpy.AddWarning(f"[SUMMARY] Skipped pages ({len(failures)}): {pages_str}")
+        else:
+            arcpy.AddMessage("[SUMMARY] No pages were skipped.")
 
         del aprx
         return
 
     def postExecute(self, parameters):
         return
-
